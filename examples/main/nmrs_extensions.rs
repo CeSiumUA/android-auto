@@ -29,6 +29,8 @@ trait NmSettingsProxy {
         device: &OwnedObjectPath,
         specific_object: &OwnedObjectPath,
     ) -> zbus::Result<(OwnedObjectPath, OwnedObjectPath)>;
+
+    fn list_connections(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
 }
 
 // The correct interface for AddAndActivateConnection is actually on NM itself:
@@ -44,6 +46,21 @@ trait NmProxy {
         device: &OwnedObjectPath,
         specific_object: &OwnedObjectPath,
     ) -> zbus::Result<(OwnedObjectPath, OwnedObjectPath)>;
+
+    fn activate_connection(
+        &self,
+        connection: &OwnedObjectPath,
+        device: &OwnedObjectPath,
+        specific_object: &OwnedObjectPath,
+    ) -> zbus::Result<OwnedObjectPath>;
+}
+
+#[proxy(
+    interface = "org.freedesktop.NetworkManager.Settings.Connection",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+trait NmConnectionProxy {
+    fn get_settings(&self) -> zbus::Result<NmSettings>;
 }
 
 #[proxy(
@@ -71,8 +88,23 @@ fn to_owned_settings(
         .collect()
 }
 
-/// Start a hotspot connection
+/// Start a hotspot connection, reusing an existing one with the same SSID if available
 pub async fn start_hotspot(ssid: String, psk: String, wifi_dev_path: &str) -> Result<(), String> {
+    let dbus = Connection::system().await.map_err(|e| e.to_string())?;
+
+    if let Some(conn_path) = find_existing_hotspot(&dbus, &ssid).await? {
+        log::info!("Reusing existing hotspot connection: {}", conn_path);
+        let wifi_device =
+            OwnedObjectPath::try_from(wifi_dev_path).map_err(|e| e.to_string())?;
+        let any = OwnedObjectPath::try_from("/").unwrap();
+        let nm = NmProxyProxy::new(&dbus).await.map_err(|e| e.to_string())?;
+        nm.activate_connection(&conn_path, &wifi_device, &any)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    log::info!("No existing hotspot found for SSID '{}', creating a new one", ssid);
     let hotspot = nmrs::builders::WifiConnectionBuilder::new(&ssid)
         .wpa_psk(&psk)
         .autoconnect(false)
@@ -81,6 +113,53 @@ pub async fn start_hotspot(ssid: String, psk: String, wifi_dev_path: &str) -> Re
     let hr = build_hotspot(wifi_dev_path, hotspot).await;
     log::info!("The result of making a hotspot is {hr:#?}");
     Ok(())
+}
+
+/// Find an existing AP/hotspot connection matching the given SSID
+async fn find_existing_hotspot(
+    dbus: &Connection,
+    ssid: &str,
+) -> Result<Option<OwnedObjectPath>, String> {
+    let settings_proxy = NmSettingsProxyProxy::new(dbus)
+        .await
+        .map_err(|e| e.to_string())?;
+    let connections = settings_proxy
+        .list_connections()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let ssid_bytes = ssid.as_bytes().to_vec();
+
+    for conn_path in connections {
+        let conn_proxy = NmConnectionProxyProxy::builder(dbus)
+            .path(conn_path.clone())
+            .map_err(|e| e.to_string())?
+            .build()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Ok(settings) = conn_proxy.get_settings().await {
+            if let Some(wifi_section) = settings.get("802-11-wireless") {
+                let is_ap = wifi_section
+                    .get("mode")
+                    .and_then(|v| String::try_from(v.clone()).ok())
+                    .map(|m| m == "ap")
+                    .unwrap_or(false);
+
+                let ssid_matches = wifi_section
+                    .get("ssid")
+                    .and_then(|v| <Vec<u8>>::try_from(v.clone()).ok())
+                    .map(|s| s == ssid_bytes)
+                    .unwrap_or(false);
+
+                if is_ap && ssid_matches {
+                    return Ok(Some(conn_path));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// construct an access point or hotspot
